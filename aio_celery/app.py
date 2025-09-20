@@ -40,6 +40,12 @@ class Celery:
         self.name = name
         self.conf = DefaultConfig()
         self._tasks_registry: dict[str, AnnotatedTask] = {}
+        self._startup_handlers: list[
+            Callable[[], Any] | Callable[[], Awaitable[Any]]
+        ] = []
+        self._shutdown_handlers: list[
+            Callable[[], Any] | Callable[[], Awaitable[Any]]
+        ] = []
         self._app_context: Any = None
         self._result_backend_connection_pool: (  # type: ignore[type-arg]
             redis.asyncio.BlockingConnectionPool | None
@@ -102,10 +108,14 @@ class Celery:
                     )
                 async with self._setup_app_context() as context:
                     self._app_context = context
+                    # Execute startup handlers after app context is set up
+                    await self._execute_startup_handlers()
                     try:
                         yield
                     finally:
                         logger.warning("Shutting down application.")
+                        # Execute shutdown handlers before app shuts down
+                        await self._execute_shutdown_handlers()
             finally:
                 set_current_app(None)
                 if self._result_backend_connection_pool is not None:
@@ -160,6 +170,104 @@ class Celery:
             return decorator(func)
         msg = "@task() takes exactly 1 argument"
         raise TypeError(msg)
+
+    def on_startup(
+        self,
+        func: Callable[[], Any] | Callable[[], Awaitable[Any]] | None = None,
+    ) -> (
+        Callable[[], Any]
+        | Callable[[], Awaitable[Any]]
+        | Callable[
+            [Callable[[], Any] | Callable[[], Awaitable[Any]]],
+            Callable[[], Any] | Callable[[], Awaitable[Any]],
+        ]
+    ):
+        """Register a function to be called when the Celery app starts.
+
+        The function can be either synchronous or asynchronous.
+
+        Usage:
+            @app.on_startup
+            async def my_async_startup():
+                print("App is starting...")
+
+            @app.on_startup
+            def my_sync_startup():
+                print("App is starting...")
+        """
+
+        def decorator(
+            f: Callable[[], Any] | Callable[[], Awaitable[Any]],
+        ) -> Callable[[], Any] | Callable[[], Awaitable[Any]]:
+            self._startup_handlers.append(f)
+            return f
+
+        if func is None:
+            return decorator
+        return decorator(func)
+
+    def on_shutdown(
+        self,
+        func: Callable[[], Any] | Callable[[], Awaitable[Any]] | None = None,
+    ) -> (
+        Callable[[], Any]
+        | Callable[[], Awaitable[Any]]
+        | Callable[
+            [Callable[[], Any] | Callable[[], Awaitable[Any]]],
+            Callable[[], Any] | Callable[[], Awaitable[Any]],
+        ]
+    ):
+        """Register a function to be called when the Celery app shuts down.
+
+        The function can be either synchronous or asynchronous.
+
+        Usage:
+            @app.on_shutdown
+            async def my_async_shutdown():
+                print("App is shutting down...")
+
+            @app.on_shutdown
+            def my_sync_shutdown():
+                print("App is shutting down...")
+        """
+
+        def decorator(
+            f: Callable[[], Any] | Callable[[], Awaitable[Any]],
+        ) -> Callable[[], Any] | Callable[[], Awaitable[Any]]:
+            self._shutdown_handlers.append(f)
+            return f
+
+        if func is None:
+            return decorator
+        return decorator(func)
+
+    async def _execute_startup_handlers(self) -> None:
+        """Execute all registered startup handlers."""
+        for handler in self._startup_handlers:
+            if asyncio.iscoroutinefunction(handler):
+                try:
+                    await handler()
+                except Exception:
+                    logger.exception("Error executing startup handler: %s", handler)
+                    # Continue executing other handlers even if one fails
+            else:
+                try:
+                    handler()
+                except Exception:
+                    logger.exception("Error executing startup handler: %s", handler)
+                    # Continue executing other handlers even if one fails
+
+    async def _execute_shutdown_handlers(self) -> None:
+        """Execute all registered shutdown handlers."""
+        try:
+            for handler in self._shutdown_handlers:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler()
+                else:
+                    handler()
+        except Exception:
+            logger.exception("Error executing shutdown handler: %s", handler)
+            # Continue executing other handlers even if one fails
 
     def _construct_extended_task_registry(self) -> dict[str, AnnotatedTask]:
         registry: dict[str, AnnotatedTask] = {}
@@ -233,3 +341,55 @@ def shared_task(
     **kwargs: Any,
 ) -> AnnotatedTask | Callable[[Callable[..., Awaitable[Any]]], AnnotatedTask]:
     return _SHARED_APP.task(*args, **kwargs)
+
+
+def shared_on_startup(
+    func: Callable[[], Any] | Callable[[], Awaitable[Any]] | None = None,
+) -> (
+    Callable[[], Any]
+    | Callable[[], Awaitable[Any]]
+    | Callable[
+        [Callable[[], Any] | Callable[[], Awaitable[Any]]],
+        Callable[[], Any] | Callable[[], Awaitable[Any]],
+    ]
+):
+    """Register a function to be called when the shared Celery app starts.
+
+    The function can be either synchronous or asynchronous.
+
+    Usage:
+        @shared_on_startup
+        async def my_async_startup():
+            print("Shared app is starting...")
+
+        @shared_on_startup
+        def my_sync_startup():
+            print("Shared app is starting...")
+    """
+    return _SHARED_APP.on_startup(func)
+
+
+def shared_on_shutdown(
+    func: Callable[[], Any] | Callable[[], Awaitable[Any]] | None = None,
+) -> (
+    Callable[[], Any]
+    | Callable[[], Awaitable[Any]]
+    | Callable[
+        [Callable[[], Any] | Callable[[], Awaitable[Any]]],
+        Callable[[], Any] | Callable[[], Awaitable[Any]],
+    ]
+):
+    """Register a function to be called when the shared Celery app shuts down.
+
+    The function can be either synchronous or asynchronous.
+
+    Usage:
+        @shared_on_shutdown
+        async def my_async_shutdown():
+            print("Shared app is shutting down...")
+
+        @shared_on_shutdown
+        def my_sync_shutdown():
+            print("Shared app is shutting down...")
+    """
+    return _SHARED_APP.on_shutdown(func)
